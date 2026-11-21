@@ -144,7 +144,15 @@ async def call_stop(req: CallStopRequest):
     if req.user_id is not None:
         # History is only available while the agent is still running, so read it before leaving
         try:
-            summary = await agora.summarize_call(await agora.get_history(req.agent_id))
+            status_info = await agora.get_agent_status(req.agent_id)
+            history = await agora.get_history(req.agent_id)
+            print(f"[call/stop] Agent {req.agent_id} status={status_info} history ({len(history)} turns): {history}")
+            summary = await agora.summarize_call(history)
+        except httpx.HTTPStatusError as exc:
+            print(
+                f"[warn] Could not summarize call {req.agent_id}: "
+                f"HTTP {exc.response.status_code} - {exc.response.text}"
+            )
         except Exception as exc:
             print(f"[warn] Could not summarize call {req.agent_id}: {exc}")
         if summary:

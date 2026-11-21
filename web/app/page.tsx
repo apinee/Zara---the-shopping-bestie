@@ -232,7 +232,11 @@ export default function VibeCartStorePage() {
 
         try {
           await client.join(app_id, channel, token, uid);
-          const micTrack = await AgoraRTC.createMicrophoneAudioTrack();
+          const micTrack = await AgoraRTC.createMicrophoneAudioTrack({
+            AEC: true,
+            ANS: true,
+            AGC: true,
+          });
           localMicTrackRef.current = micTrack;
           await client.publish([micTrack]);
         } catch (err) {

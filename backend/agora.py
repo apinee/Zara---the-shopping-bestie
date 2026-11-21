@@ -1,17 +1,26 @@
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict
 import httpx
 from agora_token_builder import RtcTokenBuilder
+from dotenv import load_dotenv
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
 ROLE_PUBLISHER = 1
 AGENT_RTC_UID = "2001"
 GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 
+def _reload_env() -> None:
+    load_dotenv(ROOT_DIR / ".env.local", override=True)
+    load_dotenv(ROOT_DIR / ".env")
+
+
 def generate_rtc_token(channel: str, uid: int | str, expire_seconds: int = 3600) -> str:
     """Generate an Agora RTC token for a given channel and integer UID."""
+    _reload_env()
     app_id = os.environ["AGORA_APP_ID"].strip()
     app_cert = os.environ["AGORA_APP_CERTIFICATE"].strip()
     privilege_expired_ts = int(time.time()) + expire_seconds
@@ -31,17 +40,18 @@ def get_llm_config() -> tuple[str, str, str]:
     Preferred: LLM_URL / LLM_API_KEY / LLM_MODEL (default URL = Gemini's OpenAI-compatible endpoint).
     Fallbacks: legacy GEMINI_* vars, OpenAI, or Neon AI Gateway.
     """
+    _reload_env()
     llm_key = (os.getenv("LLM_API_KEY") or "").strip()
     if llm_key:
         return (
             (os.getenv("LLM_URL") or GEMINI_OPENAI_URL).strip(),
             llm_key,
-            (os.getenv("LLM_MODEL") or "gemini-2.5-flash").strip(),
+            (os.getenv("LLM_MODEL") or "gemini-3.1-flash-lite").strip(),
         )
 
     gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("gemini_API_KEY") or "").strip()
     if gemini_key:
-        model = (os.getenv("GEMINI_MODEL") or os.getenv("gemini_MODEL") or "gemini-2.5-flash").strip()
+        model = (os.getenv("GEMINI_MODEL") or os.getenv("gemini_MODEL") or "gemini-3.1-flash-lite").strip()
         return (
             GEMINI_OPENAI_URL,
             gemini_key,
@@ -84,6 +94,8 @@ async def start_agent(
     agent_token = generate_rtc_token(channel, AGENT_RTC_UID)
     url = f"https://api.agora.io/api/conversational-ai-agent/v2/projects/{app_id}/join"
     llm_url, llm_key, llm_model = get_llm_config()
+    mcp_url = os.environ["MCP_PUBLIC_URL"].strip()
+    print(f"[call/start] channel={channel} llm={llm_model} ({llm_url}) key={llm_key[:6]}... mcp={mcp_url}")
 
     payload = {
         "name": f"zara-{channel}-{uuid.uuid4().hex[:6]}",
@@ -95,6 +107,15 @@ async def start_agent(
             "idle_timeout": 30,
             "advanced_features": {
                 "enable_tools": True,
+                "enable_aivad": True,
+            },
+            "turn_detection": {
+                "type": "agora_vad",
+                "interrupt_mode": "interrupt",
+                "threshold": 0.65,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 650,
+                "interrupt_duration_ms": 450,
             },
             "asr": {
                 "vendor": "deepgram",
@@ -107,6 +128,11 @@ async def start_agent(
                 "api_key": llm_key,
                 "params": {
                     "model": llm_model,
+                    **(
+                        {"reasoning_effort": "none"}
+                        if "generativelanguage.googleapis.com" in llm_url
+                        else {}
+                    ),
                 },
                 "system_messages": [
                     {"role": "system", "content": system_prompt},
@@ -143,11 +169,25 @@ async def start_agent(
         return resp.json()
 
 
+async def get_agent_status(agent_id: str) -> Dict[str, Any]:
+    """Query the current status/error message of an Agora Conversational AI agent."""
+    _reload_env()
+    app_id = os.environ["AGORA_APP_ID"].strip()
+    customer_id = os.environ["AGORA_CUSTOMER_ID"].strip()
+    customer_secret = os.environ["AGORA_CUSTOMER_SECRET"].strip()
+
+    url = f"https://api.agora.io/api/conversational-ai-agent/v2/projects/{app_id}/agents/{agent_id}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, auth=(customer_id, customer_secret))
+        return resp.json() if resp.content else {"status_code": resp.status_code}
+
+
 async def get_history(agent_id: str) -> list[Dict[str, Any]]:
     """Fetch the short-term conversation history (role/content turns) of an active agent."""
-    app_id = os.environ["AGORA_APP_ID"]
-    customer_id = os.environ["AGORA_CUSTOMER_ID"]
-    customer_secret = os.environ["AGORA_CUSTOMER_SECRET"]
+    _reload_env()
+    app_id = os.environ["AGORA_APP_ID"].strip()
+    customer_id = os.environ["AGORA_CUSTOMER_ID"].strip()
+    customer_secret = os.environ["AGORA_CUSTOMER_SECRET"].strip()
 
     url = f"https://api.agora.io/api/conversational-ai-agent/v2/projects/{app_id}/agents/{agent_id}/history"
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -192,9 +232,10 @@ async def summarize_call(contents: list[Dict[str, Any]]) -> str | None:
 
 async def leave(agent_id: str) -> Dict[str, Any]:
     """Stop an active Agora Conversational AI agent session."""
-    app_id = os.environ["AGORA_APP_ID"]
-    customer_id = os.environ["AGORA_CUSTOMER_ID"]
-    customer_secret = os.environ["AGORA_CUSTOMER_SECRET"]
+    _reload_env()
+    app_id = os.environ["AGORA_APP_ID"].strip()
+    customer_id = os.environ["AGORA_CUSTOMER_ID"].strip()
+    customer_secret = os.environ["AGORA_CUSTOMER_SECRET"].strip()
 
     url = f"https://api.agora.io/api/conversational-ai-agent/v2/projects/{app_id}/agents/{agent_id}/leave"
     async with httpx.AsyncClient(timeout=15.0) as client:

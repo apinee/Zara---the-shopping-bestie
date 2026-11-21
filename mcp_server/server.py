@@ -132,19 +132,48 @@ async def mirror_cart_to_dummyjson(user_id: int, product_id: int, qty: int) -> D
         return {"service": "DummyJSON", "call": call, "ok": False, "detail": type(exc).__name__}
 
 
-def resolve_size(prod: Any, size: str) -> tuple[str, int]:
+SPOKEN_SIZE_MAP = {
+    "SMALL": "S",
+    "MEDIUM": "M",
+    "LARGE": "L",
+    "EXTRA LARGE": "XL",
+    "X-LARGE": "XL",
+    "ONE SIZE": "One Size",
+    "ONESIZE": "One Size",
+    "FREE SIZE": "One Size",
+}
+
+
+def resolve_size(prod: Any, size: Optional[str] = "M") -> tuple[str, int]:
     """Map a requested size onto the product's size keys and return (size, available qty)."""
     sizes = prod["sizes"]
     if isinstance(sizes, str):
         sizes = json.loads(sizes)
     if not isinstance(sizes, dict) or not sizes:
-        return size.upper(), int(prod["stock"])
+        return (size or "M").upper(), int(prod["stock"])
     if len(sizes) == 1:
-        # Accessories/footwear are seeded as a single "One Size" bucket
+        # Accessories are seeded as a single "One Size" bucket
         only = next(iter(sizes))
         return only, int(sizes[only])
-    key = size.strip().upper()
-    return key, int(sizes.get(key, 0))
+
+    raw = (size or "M").strip().upper()
+    for prefix in ("SIZE ", "UK ", "US ", "EU "):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):].strip()
+    key = SPOKEN_SIZE_MAP.get(raw, raw)
+
+    # Exact case-insensitive match in product's size map
+    for k, v in sizes.items():
+        if k.upper() == key.upper():
+            return k, int(v)
+
+    # If the requested/default size (e.g. "M" on a shoe) isn't valid for this product,
+    # pick a sensible default size that has stock (prefer "M" or "8", else highest stock).
+    for preferred in ("M", "8", "9", "L", "7", "S"):
+        if preferred in sizes and int(sizes[preferred]) > 0:
+            return preferred, int(sizes[preferred])
+    best_key, best_qty = max(sizes.items(), key=lambda kv: int(kv[1]))
+    return best_key, int(best_qty)
 
 
 @mcp.custom_route("/tool-log/{user_id}", methods=["GET"])
@@ -263,25 +292,60 @@ async def check_stock(id: int, size: str = "M") -> Dict[str, Any]:
 @mcp.tool()
 async def add_to_cart(
     user_id: int,
-    product_id: int,
+    product_id: Optional[int] = None,
+    product_name: Optional[str] = None,
     size: str = "M",
     qty: int = 1,
 ) -> Dict[str, Any]:
-    """Add a product in a specific size and quantity to the user's cart."""
-    args = {"user_id": user_id, "product_id": product_id, "size": size, "qty": qty}
+    """
+    Add a product to the shopper's cart. Call this whenever the shopper says "add to cart",
+    "put this in my cart", "I'll take it", or asks to buy/cart a product.
+    Pass `product_id` (preferred) OR `product_name` (e.g. "Nike Cleats", "Red Dress", "Blue Shirt").
+    If they didn't mention a size, omit `size` and an available size will be chosen automatically.
+    """
+    args = {
+        "user_id": user_id,
+        "product_id": product_id,
+        "product_name": product_name,
+        "size": size,
+        "qty": qty,
+    }
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            prod = await conn.fetchrow(
-                "SELECT id, name, price_inr, stock, sizes FROM products WHERE id = $1",
-                product_id,
-            )
+            prod = None
+            if product_id is not None:
+                prod = await conn.fetchrow(
+                    "SELECT id, name, price_inr, stock, sizes FROM products WHERE id = $1",
+                    int(product_id),
+                )
+            if not prod and product_name:
+                words = [w.rstrip("s") if len(w) > 3 else w for w in product_name.lower().split()]
+                prod = await conn.fetchrow(
+                    """
+                    SELECT id, name, price_inr, stock, sizes
+                    FROM products
+                    WHERE name ILIKE '%' || $1 || '%'
+                       OR NOT EXISTS (
+                            SELECT 1 FROM unnest($2::text[]) AS w
+                            WHERE NOT (name ILIKE '%' || w || '%' OR article_type ILIKE '%' || w || '%'
+                                       OR colour ILIKE '%' || w || '%' OR category ILIKE '%' || w || '%')
+                          )
+                    ORDER BY (CASE WHEN name ILIKE '%' || $1 || '%' THEN 0 ELSE 1 END), stock DESC
+                    LIMIT 1
+                    """,
+                    product_name.strip(),
+                    words,
+                )
             if not prod:
-                log_tool("add_to_cart", args, f"Product #{product_id} not found", "error", user_id)
-                return {"error": "Product not found"}
-            size, available = resolve_size(prod, size)
+                target = f"#{product_id}" if product_id is not None else f"'{product_name}'"
+                log_tool("add_to_cart", args, f"Product {target} not found", "error", user_id)
+                return {"error": f"Product {target} not found"}
+
+            real_id = int(prod["id"])
+            resolved_size, available = resolve_size(prod, size)
             if available < qty:
-                msg = f"{prod['name']} ({size}) has only {available} left"
+                msg = f"{prod['name']} ({resolved_size}) has only {available} left"
                 log_tool("add_to_cart", args, msg, "error", user_id)
                 return {"error": msg, "available_qty": available}
 
@@ -293,16 +357,24 @@ async def add_to_cart(
                 DO UPDATE SET qty = cart_items.qty + EXCLUDED.qty
                 """,
                 user_id,
-                product_id,
-                size,
+                real_id,
+                resolved_size,
                 qty,
             )
-            learned = await learn(conn, user_id, product_id, "CARTED", 1.0, size)
+            learned = await learn(conn, user_id, real_id, "CARTED", 1.0, resolved_size)
         # Postgres is the source of truth; the DummyJSON mirror is best-effort and never blocks the cart
-        external = await mirror_cart_to_dummyjson(user_id, product_id, qty)
-        summary = f"Added {qty}x {prod['name']} ({size}) — ₹{prod['price_inr']}"
+        external = await mirror_cart_to_dummyjson(user_id, real_id, qty)
+        summary = f"Added {qty}x {prod['name']} ({resolved_size}) — {prod['price_inr']} rupees"
         log_tool("add_to_cart", args, summary, "ok", user_id, [external], learned)
-        return {"ok": True, "message": summary}
+        return {
+            "ok": True,
+            "product_id": real_id,
+            "name": prod["name"],
+            "size": resolved_size,
+            "qty": qty,
+            "price_inr": prod["price_inr"],
+            "message": summary,
+        }
     except Exception as exc:
         log_tool("add_to_cart", args, str(exc), "error", user_id)
         return {"error": str(exc)}
@@ -676,9 +748,11 @@ async def recommend_for_me(user_id: int, query: str = "", limit: int = 5) -> Lis
         picks = [dict(r) for r in rows]
         for p in picks:
             p["score"] = round(p["score"], 2)
+        if not picks:
+            return await search_products(query=query)
         top = f" — top: {picks[0]['name']}" if picks else ""
         log_tool("recommend_for_me", args, f"{len(picks)} picks from memory graph{top}", "ok", user_id)
-        return picks or [{"note": "Not enough memory yet — use search_products instead."}]
+        return picks
     except Exception as exc:
         log_tool("recommend_for_me", args, str(exc), "error", user_id)
         return [{"error": str(exc)}]
