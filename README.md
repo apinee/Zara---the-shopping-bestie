@@ -9,7 +9,7 @@ VibeCart replaces search bars, filters and twelve-step checkouts with **one conv
 
 [![Watch the VibeCart demo](https://cdn.loom.com/sessions/thumbnails/691b3e819ec94e71a4f10c46ab56bb63-with-play.gif)](https://www.loom.com/share/691b3e819ec94e71a4f10c46ab56bb63)
 
-▶️ **[Watch the full demo on Loom](https://www.loom.com/share/691b3e819ec94e71a4f10c46ab56bb63)**
+▶️ **[Watch the full demo on Loom](https://www.loom.com/share/691b3e819ec94e71a4f10c46ab56bb63)**  ·  🎞️ **[Download the demo video (MP4)](docs/vibecart-demo.mp4)**
 
 ---
 
