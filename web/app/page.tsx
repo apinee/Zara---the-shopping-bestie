@@ -5,14 +5,92 @@ import MemoryGraph, { GraphEdge } from "./MemoryGraph";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 
+const INR = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
+// `|| 0` turns -0 into 0 so a zero discount never renders as "-₹0"
+const inr = (n: number) => INR.format(Number(n) || 0);
+
+const SWATCHES: Record<string, string> = {
+  black: "#111", white: "#f5f5f5", blue: "#3b82f6", navy: "#1e3a8a", red: "#ef4444", green: "#22c55e",
+  yellow: "#facc15", pink: "#f472b6", purple: "#a855f7", orange: "#fb923c", brown: "#92400e",
+  grey: "#9ca3af", beige: "#e7d7b5", gold: "#d4a72c", silver: "#cbd5e1", maroon: "#7f1d1d", olive: "#65a30d",
+};
+const swatch = (colour?: string) =>
+  SWATCHES[(colour || "").toLowerCase().split(" ").pop() || ""] ||
+  "conic-gradient(#f472b6, #a855f7, #3b82f6, #22c55e, #facc15, #f472b6)";
+
+// ---------- Live transcripts from the Agora agent (RTC data stream) ----------
+interface Caption {
+  text: string;
+  done: boolean;
+}
+type ChunkBuffer = Map<string, { parts: Record<number, string>; total: number; at: number }>;
+const textDecoder = typeof TextDecoder !== "undefined" ? new TextDecoder() : null;
+
+/**
+ * Decode one `stream-message` payload into a JSON message, or null if it's partial/unknown.
+ * Handles plain JSON and the chunked form "<message_id>|<part_idx>|<part_sum>|<base64 chunk>"
+ * (parts are reassembled in index order, whether they're numbered from 0 or 1).
+ */
+function decodeAgentMessage(raw: Uint8Array, buffer: ChunkBuffer): any | null {
+  if (!textDecoder) return null;
+  const text = textDecoder.decode(raw);
+  if (text.startsWith("{")) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+  const match = text.match(/^([^|]+)\|(\d+)\|(\d+)\|([\s\S]*)$/);
+  if (!match) return null;
+  const [, id, idx, total, part] = match;
+  const now = Date.now();
+  buffer.forEach((v, k) => {
+    if (now - v.at > 15000) buffer.delete(k); // drop messages whose other parts never arrived
+  });
+  const entry = buffer.get(id) || { parts: {}, total: Number(total), at: now };
+  entry.parts[Number(idx)] = part;
+  buffer.set(id, entry);
+  const keys = Object.keys(entry.parts).map(Number).sort((a, b) => a - b);
+  if (keys.length < entry.total) return null;
+  buffer.delete(id);
+  try {
+    const binary = atob(keys.map((k) => entry.parts[k]).join(""));
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return JSON.parse(textDecoder.decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
+const PROMPTS = ["Show me blue shirts", "Suggest something for me", "What's my size?", "Apply coupon ZARA20"];
+
+function MicIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="9" y="2" width="6" height="12" rx="3" />
+      <path d="M5 10a7 7 0 0 0 14 0M12 17v5" />
+    </svg>
+  );
+}
+
 interface Product {
   id: number;
   name: string;
   price_inr: number;
   colour?: string;
   category?: string;
+  article_type?: string;
   stock?: number;
+  sizes?: Record<string, number> | string;
   image_url?: string;
+  option?: number;
+}
+
+interface ShowcaseState {
+  query: string;
+  items: Product[];
+  timestamp: number;
 }
 
 interface CartItem {
@@ -22,6 +100,7 @@ interface CartItem {
   size: string;
   qty: number;
   price_inr: number;
+  image_url?: string;
 }
 
 interface CartState {
@@ -64,6 +143,9 @@ export default function VibeCartStorePage() {
 
   // Storefront & Right Side Panel state
   const [products, setProducts] = useState<Product[]>([]);
+  const [productsStatus, setProductsStatus] = useState<"loading" | "ready" | "error">("loading");
+  // True when the 2s poll can't reach the backend, so a stale cart isn't mistaken for the real one
+  const [backendDown, setBackendDown] = useState(false);
   const [cart, setCart] = useState<CartState>({
     items: [],
     coupon_code: null,
@@ -77,6 +159,11 @@ export default function VibeCartStorePage() {
     last_call_summary: "",
   });
   const [toolLogs, setToolLogs] = useState<ToolLogEntry[]>([]);
+  const [showcase, setShowcase] = useState<ShowcaseState>({ query: "", items: [], timestamp: 0 });
+  const [dismissedTs, setDismissedTs] = useState<number>(0);
+  const [selectedSizes, setSelectedSizes] = useState<Record<number, string>>({});
+  const [addingId, setAddingId] = useState<number | null>(null);
+  const [categoryFilter, setCategoryFilter] = useState("All");
 
   // Agora RTC Voice Call state
   const [inCall, setInCall] = useState(false);
@@ -85,6 +172,13 @@ export default function VibeCartStorePage() {
   const [callError, setCallError] = useState("");
   const rtcClientRef = useRef<any>(null);
   const localMicTrackRef = useRef<any>(null);
+
+  // Live captions + "refresh now" hooks so the panel updates the moment Zara acts
+  const [userCaption, setUserCaption] = useState<Caption | null>(null);
+  const [zaraCaption, setZaraCaption] = useState<Caption | null>(null);
+  const chunkBufferRef = useRef<ChunkBuffer>(new Map());
+  const lastZaraTurnRef = useRef<string | number | null>(null);
+  const pollRef = useRef<() => void>(() => {});
 
   // Razorpay Checkout state
   const [razorpayKeyId, setRazorpayKeyId] = useState("");
@@ -108,39 +202,82 @@ export default function VibeCartStorePage() {
       .catch(() => {});
   }, []);
 
-  useEffect(() => {
+  function loadProducts() {
+    setProductsStatus("loading");
     fetch(`${BACKEND_URL}/products`)
-      .then((r) => r.json())
-      .then((data) => setProducts(data.products || []))
-      .catch(() => {});
-  }, []);
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data) => {
+        setProducts(data.products || []);
+        setProductsStatus("ready");
+      })
+      .catch(() => setProductsStatus("error"));
+  }
 
-  // Poll Cart, Memory, and Tool Log every 2s once logged in
+  useEffect(loadProducts, []);
+
+  // Poll Cart, Memory, and Tool Log once logged in: every 1s during a call, 2.5s otherwise.
+  // Transcript events also trigger an immediate poll via pollRef.
   useEffect(() => {
     if (!user) return;
+    let inFlight = false;
 
     const poll = async () => {
+      if (inFlight) return; // never stack requests if the backend is slow
+      inFlight = true;
       try {
         const [cartRes, memRes, logRes] = await Promise.all([
           fetch(`${BACKEND_URL}/cart/${user.user_id}`),
           fetch(`${BACKEND_URL}/memory/${user.user_id}`),
           fetch(`${BACKEND_URL}/tool-log/${user.user_id}`),
         ]);
+        setBackendDown(!(cartRes.ok && memRes.ok));
         if (cartRes.ok) setCart(await cartRes.json());
         if (memRes.ok) setMemory(await memRes.json());
         if (logRes.ok) {
           const logData = await logRes.json();
           setToolLogs(logData.logs || []);
+          if (logData.showcase && Array.isArray(logData.showcase.items)) {
+            setShowcase(logData.showcase);
+          }
         }
       } catch {
-        // Ignore transient polling errors
+        // Network error: keep the last good data on screen but flag it as stale
+        setBackendDown(true);
+      } finally {
+        inFlight = false;
       }
     };
 
+    pollRef.current = poll;
     poll();
-    const interval = setInterval(poll, 2000);
+    const interval = setInterval(poll, inCall ? 1000 : 2500);
     return () => clearInterval(interval);
-  }, [user]);
+  }, [user, inCall]);
+
+  // Handle one decoded agent message: update captions, and refresh the panel when a turn completes
+  function handleAgentMessage(msg: any) {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.object === "user.transcription") {
+      const done = Boolean(msg.final);
+      setUserCaption({ text: String(msg.text || ""), done });
+      if (done) setTimeout(() => pollRef.current(), 400);
+    } else if (msg.object === "assistant.transcription") {
+      // turn_status: 0 in progress, 1 end, 2 interrupted
+      setZaraCaption({ text: String(msg.text || ""), done: msg.turn_status !== 0 });
+      const turn = msg.turn_id ?? msg.turn_seq_id ?? null;
+      if (turn !== lastZaraTurnRef.current) {
+        // Zara just started a new reply: her tool calls ran right before it, so fetch their results now
+        lastZaraTurnRef.current = turn;
+        pollRef.current();
+      }
+      if (msg.turn_status === 1) pollRef.current();
+    } else if (msg.object === "message.interrupt") {
+      setZaraCaption((c) => (c ? { ...c, done: true } : c));
+    }
+  }
 
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
@@ -190,6 +327,10 @@ export default function VibeCartStorePage() {
     }
     setAgentId(null);
     setInCall(false);
+    setUserCaption(null);
+    setZaraCaption(null);
+    lastZaraTurnRef.current = null;
+    chunkBufferRef.current.clear();
   }
 
   async function toggleCall() {
@@ -221,6 +362,17 @@ export default function VibeCartStorePage() {
           if (mediaType === "audio" && remoteUser.audioTrack) {
             remoteUser.audioTrack.play();
           }
+        });
+
+        // Live transcripts + agent events arrive over the RTC data stream
+        let loggedStreamMessages = 0;
+        client.on("stream-message", (_uid: any, payload: Uint8Array) => {
+          const msg = decodeAgentMessage(payload, chunkBufferRef.current);
+          if (msg && loggedStreamMessages < 5) {
+            loggedStreamMessages++;
+            console.debug("[zara-stream]", msg.object, msg); // first few only: confirms transcripts are flowing
+          }
+          handleAgentMessage(msg);
         });
 
         // Zara (agent uid 2001) leaves on idle_timeout — reset the call UI when that happens
@@ -316,6 +468,47 @@ export default function VibeCartStorePage() {
     (o) => o.status === "created" && o.razorpay_order_id && !o.razorpay_order_id.startsWith("order_test_")
   );
 
+  function getSizeKeys(p: Product): string[] {
+    if (!p.sizes) return ["M"];
+    let parsed: any = p.sizes;
+    if (typeof parsed === "string") {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch {
+        return ["M"];
+      }
+    }
+    if (parsed && typeof parsed === "object") {
+      const keys = Object.keys(parsed).filter((k) => Number(parsed[k]) > 0);
+      return keys.length > 0 ? keys : Object.keys(parsed);
+    }
+    return ["M"];
+  }
+
+  async function quickAddToCart(p: Product) {
+    if (!user) return;
+    const sizeKeys = getSizeKeys(p);
+    const chosenSize = selectedSizes[p.id] || sizeKeys[0] || "M";
+    setAddingId(p.id);
+    try {
+      const res = await fetch(`${BACKEND_URL}/cart/add`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: user.user_id,
+          product_id: p.id,
+          size: chosenSize,
+          qty: 1,
+        }),
+      });
+      if (res.ok) {
+        setCart(await res.json());
+      }
+    } finally {
+      setAddingId(null);
+    }
+  }
+
   function logout() {
     if (inCall) endCall(agentId);
     try {
@@ -326,462 +519,420 @@ export default function VibeCartStorePage() {
     setUser(null);
   }
 
+  const categories = ["All", ...Array.from(new Set(products.map((p) => p.category).filter(Boolean) as string[]))];
+  const visibleProducts =
+    categoryFilter === "All" ? products : products.filter((p) => p.category === categoryFilter);
+  const firstName = user?.name?.split(" ")[0] || "bestie";
+  const prefEntries = Object.entries(memory.preferences || {});
+
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 360px", minHeight: "100vh" }}>
-      {/* Left: Store Home Page & Product Grid */}
-      <main style={{ padding: "24px 32px", paddingBottom: "100px" }}>
-        <header
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            marginBottom: "24px",
-          }}
-        >
-          <div>
-            <h1 style={{ fontSize: "24px", fontWeight: 700 }}>VibeCart ✨</h1>
-            <p style={{ color: "#9ca3af", fontSize: "14px" }}>
-              Shop by talking with Zara — your Bengaluru shopping bestie
-            </p>
+    <div className="shell">
+      {/* Left: store */}
+      <main className="store">
+        <header className="topbar">
+          <div className="brand">
+            <span className="brand-mark" aria-hidden="true">V</span>
+            <div>
+              <h1 className="brand-name">
+                Vibe<span>Cart</span>
+              </h1>
+              <p className="brand-tag">Shop by talking · Bengaluru edition</p>
+            </div>
           </div>
           {user && (
-            <span style={{ fontSize: "14px", color: "#a78bfa" }}>
-              Logged in as <strong>{user.name}</strong> (#{user.user_id}) ·{" "}
-              <button
-                onClick={logout}
-                style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer", padding: 0 }}
-              >
+            <div className="user-pill">
+              <span className="avatar" aria-hidden="true">
+                {user.name.charAt(0).toUpperCase()}
+              </span>
+              <span>{user.name}</span>
+              <button className="link-btn" onClick={logout}>
                 Log out
               </button>
-            </span>
+            </div>
           )}
         </header>
 
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))",
-            gap: "16px",
-          }}
-        >
-          {products.map((p) => (
-            <div
-              key={p.id}
-              style={{
-                background: "#181b24",
-                border: "1px solid #262a36",
-                borderRadius: "12px",
-                overflow: "hidden",
-                display: "flex",
-                flexDirection: "column",
-              }}
-            >
-              <div style={{ height: "210px", background: "#fff", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <img
-                  src={p.image_url || `/products/${p.id}.jpg`}
-                  alt={p.name}
-                  style={{ maxHeight: "100%", maxWidth: "100%", objectFit: "contain" }}
-                />
+        {/* Zara hero */}
+        <section className={`hero ${inCall ? "is-live" : ""}`}>
+          <div className="zara-orb" aria-hidden="true">
+            Z
+          </div>
+          <div>
+            <p className="eyebrow">{inCall ? "Zara is listening" : "Meet Zara"}</p>
+            <h2>
+              {inCall ? `Go on ${firstName}, tell me what you're looking for.` : `Hey ${firstName}, scene kya hai today?`}
+            </h2>
+            {inCall ? (
+              <div className="captions" aria-live="polite">
+                <p className={`caption ${userCaption && !userCaption.done ? "is-partial" : ""}`}>
+                  <span className="caption-who">You</span>
+                  {userCaption?.text || "Start talking…"}
+                </p>
+                <p className={`caption caption-zara ${zaraCaption && !zaraCaption.done ? "is-partial" : ""}`}>
+                  <span className="caption-who">Zara</span>
+                  {zaraCaption?.text || "…"}
+                </p>
               </div>
-              <div style={{ padding: "12px" }}>
-                <div style={{ fontSize: "11px", color: "#9ca3af", marginBottom: "4px" }}>
-                  #{p.id} · {p.colour}
+            ) : (
+              <>
+                <p className="hero-sub">
+                  Your shopping bestie finds it, checks your size, fills the cart and remembers your taste for next time.
+                </p>
+                <div className="prompt-chips" aria-label="Things you can say">
+                  {PROMPTS.map((t) => (
+                    <span key={t} className="chip">
+                      &ldquo;{t}&rdquo;
+                    </span>
+                  ))}
                 </div>
-                <div
-                  style={{
-                    fontSize: "14px",
-                    fontWeight: 500,
-                    lineHeight: 1.3,
-                    marginBottom: "8px",
-                    height: "36px",
-                    overflow: "hidden",
-                  }}
-                >
-                  {p.name}
-                </div>
-                <div style={{ fontSize: "16px", fontWeight: 700, color: "#34d399" }}>
-                  ₹{p.price_inr}
-                </div>
-              </div>
+              </>
+            )}
+          </div>
+          {inCall && (
+            <div className="eq" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+              <i />
+              <i />
             </div>
-          ))}
+          )}
+        </section>
+
+        {/* Zara's live options spotlight */}
+        {showcase.items.length > 0 && showcase.timestamp > dismissedTs && (
+          <section className="spotlight" aria-live="polite">
+            <div className="spotlight-head">
+              <div>
+                <span className="badge-live">Live from Zara</span>
+                <h2>Options for &ldquo;{showcase.query}&rdquo;</h2>
+                <p>
+                  Say <strong>&ldquo;add option 1&rdquo;</strong>, or pick a size and tap.
+                </p>
+              </div>
+              <button className="ghost-btn" onClick={() => setDismissedTs(showcase.timestamp)}>
+                Clear options
+              </button>
+            </div>
+            <div className="grid grid-lg">
+              {showcase.items.map((p, idx) => {
+                const optNum = p.option || idx + 1;
+                const sizeKeys = getSizeKeys(p);
+                const activeSize = selectedSizes[p.id] || sizeKeys[0] || "M";
+                return (
+                  <article key={p.id} className="card product">
+                    <span className="option-tag">Option {optNum}</span>
+                    <div className="product-media">
+                      <img src={p.image_url || `/products/${p.id}.jpg`} alt={p.name} />
+                    </div>
+                    <div className="product-body">
+                      <div className="meta">
+                        <span className="swatch" style={{ background: swatch(p.colour) }} />
+                        {p.colour} · {p.article_type || p.category}
+                      </div>
+                      <h3 className="product-name">{p.name}</h3>
+                      <div className="price">{inr(p.price_inr)}</div>
+                      <div className="sizes" role="group" aria-label={`Size for option ${optNum}`}>
+                        {sizeKeys.map((sz) => (
+                          <button
+                            key={sz}
+                            className={`size ${activeSize === sz ? "is-active" : ""}`}
+                            aria-pressed={activeSize === sz}
+                            onClick={() => setSelectedSizes((prev) => ({ ...prev, [p.id]: sz }))}
+                          >
+                            {sz}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        className="btn btn-primary btn-block"
+                        onClick={() => quickAddToCart(p)}
+                        disabled={addingId === p.id}
+                      >
+                        {addingId === p.id ? "Adding…" : `Add option ${optNum} · ${activeSize}`}
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* Catalogue */}
+        <div className="section-head">
+          <h2>The edit</h2>
+          {productsStatus === "ready" && products.length > 0 && (
+            <div className="filters" role="group" aria-label="Filter by category">
+              {categories.map((c) => (
+                <button
+                  key={c}
+                  className={`filter ${categoryFilter === c ? "is-active" : ""}`}
+                  aria-pressed={categoryFilter === c}
+                  onClick={() => setCategoryFilter(c)}
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {productsStatus === "error" && (
+          <div className="notice notice-error" role="alert">
+            Couldn&apos;t load products from {BACKEND_URL}. Check that the backend is running.{" "}
+            <button className="link-btn" style={{ color: "#c4b5fd" }} onClick={loadProducts}>
+              Try again
+            </button>
+          </div>
+        )}
+        {productsStatus === "ready" && products.length === 0 && (
+          <div className="empty-state">
+            No products yet. Run <code>python scripts/seed_products.py</code> to add them.
+          </div>
+        )}
+
+        <div className="grid" aria-busy={productsStatus === "loading"}>
+          {productsStatus === "loading" &&
+            Array.from({ length: 8 }).map((_, i) => <div key={i} className="card skeleton" aria-hidden="true" />)}
+          {visibleProducts.map((p) => {
+            const soldOut = p.stock === 0;
+            const lowStock = !soldOut && p.stock !== undefined && p.stock <= 5;
+            return (
+              <article key={p.id} className={`card product ${soldOut ? "is-out" : ""}`}>
+                <div className="product-media">
+                  <img src={p.image_url || `/products/${p.id}.jpg`} alt={p.name} loading="lazy" />
+                  {lowStock && <span className="stock-badge">Only {p.stock} left</span>}
+                  {soldOut && <span className="stock-badge is-out">Sold out</span>}
+                </div>
+                <div className="product-body">
+                  <div className="meta">
+                    <span className="swatch" style={{ background: swatch(p.colour) }} />
+                    {p.colour} · {p.article_type || p.category}
+                  </div>
+                  <h3 className="product-name">{p.name}</h3>
+                  <div className="product-foot">
+                    <span className="price">{inr(p.price_inr)}</span>
+                    <span className="pid">#{p.id}</span>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
         </div>
       </main>
 
-      {/* Right Side Panel: Polls every 2s (Cart, Memory, Live Actions) */}
-      <aside
-        style={{
-          background: "#141720",
-          borderLeft: "1px solid #262a36",
-          padding: "20px",
-          display: "flex",
-          flexDirection: "column",
-          gap: "16px",
-          height: "100vh",
-          position: "sticky",
-          top: 0,
-          overflowY: "auto",
-        }}
-      >
-        {/* Card 1: Cart */}
-        <section
-          style={{
-            background: "#1c202c",
-            borderRadius: "12px",
-            padding: "14px",
-            border: "1px solid #2b3040",
-          }}
-        >
-          <h2 style={{ fontSize: "15px", fontWeight: 600, marginBottom: "10px" }}>
-            🛒 Your Cart ({cart.items.length})
-          </h2>
+      {/* Right: live panel (polls every 2s) */}
+      <aside className="panel">
+        {backendDown && (
+          <div className="notice notice-warn" role="status">
+            Can&apos;t reach the backend. The cart and memory below may be out of date.
+          </div>
+        )}
+
+        {/* Cart */}
+        <section className="card panel-card">
+          <header className="panel-head">
+            <span className="panel-icon" aria-hidden="true">🛍️</span>
+            <h2>Your cart</h2>
+            <span className="count">{cart.items.length}</span>
+          </header>
           {cart.items.length === 0 ? (
-            <p style={{ fontSize: "13px", color: "#9ca3af" }}>
-              Cart is empty. Tell Zara what you want to try!
-            </p>
+            <p className="muted small">Empty for now. Tell Zara what you want to try.</p>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-              {cart.items.map((item) => (
-                <div
-                  key={`${item.product_id}-${item.size}`}
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    fontSize: "13px",
-                  }}
-                >
-                  <span>
-                    {item.qty}x {item.name} ({item.size})
-                  </span>
-                  <strong>₹{item.price_inr * item.qty}</strong>
+            <>
+              <ul className="cart-list">
+                {cart.items.map((item) => (
+                  <li key={`${item.product_id}-${item.size}`} className="cart-item">
+                    <div className="cart-thumb">{item.image_url && <img src={item.image_url} alt="" />}</div>
+                    <div className="cart-info">
+                      <span className="cart-name">{item.name}</span>
+                      <span className="muted small">
+                        Size {item.size} · Qty {item.qty}
+                      </span>
+                    </div>
+                    <strong>{inr(item.price_inr * item.qty)}</strong>
+                  </li>
+                ))}
+              </ul>
+              <div className="totals">
+                {cart.coupon_code && (
+                  <div className="row discount">
+                    <span>Coupon {cart.coupon_code}</span>
+                    <span>−{inr(cart.discount_inr)}</span>
+                  </div>
+                )}
+                <div className="row total">
+                  <span>Total</span>
+                  <span>{inr(cart.total_inr)}</span>
                 </div>
-              ))}
-              <hr style={{ borderColor: "#2b3040", margin: "6px 0" }} />
-              {cart.coupon_code && (
-                <div style={{ fontSize: "12px", color: "#34d399" }}>
-                  Coupon {cart.coupon_code}: -₹{cart.discount_inr}
-                </div>
-              )}
-              <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 700 }}>
-                <span>Total</span>
-                <span>₹{cart.total_inr}</span>
               </div>
-            </div>
+            </>
           )}
         </section>
 
-        {/* Card 1a: Order confirmation for the latest order */}
+        {/* Latest order confirmation */}
         {latestOrder && (
-          <section
-            style={{
-              background: "#052e1c",
-              borderRadius: "12px",
-              padding: "14px",
-              border: "1px solid #065f46",
-            }}
-          >
-            <h2 style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>
-              ✅ Order confirmed
-            </h2>
-            <div style={{ fontSize: "13px", display: "grid", gridTemplateColumns: "auto 1fr", gap: "4px 10px" }}>
-              <span style={{ color: "#9ca3af" }}>Order ID</span>
-              <strong>#{latestOrder.order_id}</strong>
-              <span style={{ color: "#9ca3af" }}>Tracking ID</span>
-              <strong style={{ fontFamily: "ui-monospace, monospace" }}>{latestOrder.tracking_id || "—"}</strong>
-              <span style={{ color: "#9ca3af" }}>Razorpay</span>
-              <span style={{ fontFamily: "ui-monospace, monospace", fontSize: "11px", wordBreak: "break-all" }}>
-                {latestOrder.razorpay_order_id || "—"}
-              </span>
-              <span style={{ color: "#9ca3af" }}>Amount</span>
-              <strong>
-                ₹{latestOrder.amount_inr} · {latestOrder.status}
-              </strong>
-            </div>
+          <section className="card order-card">
+            <header className="panel-head">
+              <span className="panel-icon" aria-hidden="true">✅</span>
+              <h2>Order confirmed</h2>
+            </header>
+            <dl className="order-grid">
+              <dt>Order</dt>
+              <dd>
+                #{latestOrder.order_id}
+                <span className="status-pill">{latestOrder.status}</span>
+              </dd>
+              <dt>Tracking</dt>
+              <dd className="mono">{latestOrder.tracking_id || "—"}</dd>
+              <dt>Razorpay</dt>
+              <dd className="mono small">{latestOrder.razorpay_order_id || "—"}</dd>
+              <dt>Amount</dt>
+              <dd>{inr(latestOrder.amount_inr)}</dd>
+            </dl>
           </section>
         )}
 
-        {/* Card 1b: Orders awaiting payment (created by Zara's checkout tool) */}
+        {/* Orders awaiting payment */}
         {(unpaidOrders.length > 0 || payStatus) && (
-          <section
-            style={{
-              background: "#1c202c",
-              borderRadius: "12px",
-              padding: "14px",
-              border: "1px solid #2b3040",
-            }}
-          >
-            <h2 style={{ fontSize: "15px", fontWeight: 600, marginBottom: "10px" }}>💳 Pay for your order</h2>
+          <section className="card panel-card">
+            <header className="panel-head">
+              <span className="panel-icon" aria-hidden="true">💳</span>
+              <h2>Pay for your order</h2>
+            </header>
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
               {unpaidOrders.map((o) => (
-                <button
-                  key={o.order_id}
-                  onClick={() => payForOrder(o)}
-                  style={{
-                    background: "#059669",
-                    color: "#fff",
-                    border: "none",
-                    borderRadius: "8px",
-                    padding: "10px",
-                    fontWeight: 600,
-                    cursor: "pointer",
-                  }}
-                >
-                  Pay ₹{o.amount_inr} · Order #{o.order_id}
+                <button key={o.order_id} className="btn btn-success btn-block" onClick={() => payForOrder(o)}>
+                  Pay {inr(o.amount_inr)} · Order #{o.order_id}
                 </button>
               ))}
-              {payStatus && <div style={{ fontSize: "12px", color: "#d1d5db" }}>{payStatus}</div>}
+              {payStatus && <p className="pay-status">{payStatus}</p>}
             </div>
           </section>
         )}
 
-        {/* Card 2: What Zara knows about you */}
-        <section
-          style={{
-            background: "#1c202c",
-            borderRadius: "12px",
-            padding: "14px",
-            border: "1px solid #2b3040",
-          }}
-        >
-          <h2 style={{ fontSize: "15px", fontWeight: 600, marginBottom: "10px" }}>
-            🧠 What Zara knows about you
-          </h2>
-          <MemoryGraph center={memory.graph?.center || user?.name || "You"} edges={memory.graph?.edges || []} />
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "10px" }}>
-            {Object.entries(memory.preferences || {}).length === 0 ? (
-              <span style={{ fontSize: "12px", color: "#9ca3af" }}>No preferences saved yet</span>
-            ) : (
-              Object.entries(memory.preferences).map(([k, v]) => (
-                <span
-                  key={k}
-                  style={{
-                    background: "#2e1065",
-                    color: "#ddd6fe",
-                    fontSize: "12px",
-                    padding: "3px 8px",
-                    borderRadius: "999px",
-                  }}
-                >
-                  {k}: {v}
+        {/* Memory graph */}
+        <section className="card panel-card">
+          <header className="panel-head">
+            <span className="panel-icon" aria-hidden="true">🧠</span>
+            <h2>What Zara knows about you</h2>
+            {inCall && <span className="badge-live">Live</span>}
+          </header>
+          <MemoryGraph
+            center={memory.graph?.center || user?.name || "You"}
+            edges={memory.graph?.edges}
+            live={inCall}
+          />
+          {prefEntries.length > 0 && (
+            <div className="pref-chips">
+              {prefEntries.map(([k, v]) => (
+                <span key={k} className="pref-chip">
+                  {k.replace(/_/g, " ")}: {v}
                 </span>
-              ))
-            )}
-          </div>
-          {(memory.recent_purchases || []).length > 0 && (
-            <div style={{ fontSize: "12px", color: "#d1d5db", marginBottom: "8px" }}>
-              Recent orders:{" "}
-              {memory.recent_purchases
-                .map((o) => `#${o.order_id} ₹${o.amount_inr} (${o.status})`)
-                .join(", ")}
+              ))}
             </div>
           )}
-          {memory.last_call_summary && (
-            <p style={{ fontSize: "12px", color: "#9ca3af" }}>
-              Last vibe: {memory.last_call_summary}
-            </p>
-          )}
+          {memory.last_call_summary && <p className="last-vibe">Last vibe: {memory.last_call_summary}</p>}
         </section>
 
-        {/* Card 3: Live actions (tool log with ✓ ticks) */}
-        <section
-          style={{
-            background: "#1c202c",
-            borderRadius: "12px",
-            padding: "14px",
-            border: "1px solid #2b3040",
-            flex: 1,
-          }}
-        >
-          <h2 style={{ fontSize: "15px", fontWeight: 600, marginBottom: "10px" }}>
-            ⚡ Live actions
-          </h2>
+        {/* Live actions timeline */}
+        <section className="card panel-card" style={{ flex: 1 }}>
+          <header className="panel-head">
+            <span className="panel-icon" aria-hidden="true">⚡</span>
+            <h2>Live actions</h2>
+            {inCall ? (
+              <span className="badge-live">Live</span>
+            ) : (
+              toolLogs.length > 0 && <span className="count">{toolLogs.length}</span>
+            )}
+          </header>
           {toolLogs.length === 0 ? (
-            <p style={{ fontSize: "12px", color: "#9ca3af" }}>
-              Tool calls will appear here as Zara searches & updates your cart.
-            </p>
+            <p className="muted small">Every tool Zara uses shows up here as she searches and fills your cart.</p>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            <ol className="timeline">
               {toolLogs.map((entry) => (
-                <div
-                  key={entry.id}
-                  style={{
-                    fontSize: "12px",
-                    background: "#141720",
-                    padding: "8px 10px",
-                    borderRadius: "8px",
-                    border: "1px solid #262a36",
-                  }}
-                >
-                  <div style={{ fontWeight: 600, color: entry.status === "ok" ? "#34d399" : "#f87171" }}>
-                    {entry.status === "ok" ? "✓" : "✗"} {entry.tool}
+                <li key={entry.id} className={`timeline-item ${entry.status === "ok" ? "" : "is-error"}`}>
+                  <span className="timeline-dot" aria-hidden="true" />
+                  <div>
+                    <span className="tool-check">{entry.status === "ok" ? "✓" : "✗"}</span>
+                    <span className="tool-name">{entry.tool}</span>
                   </div>
-                  <div style={{ color: "#d1d5db", marginTop: "2px" }}>{entry.summary}</div>
+                  <div className="tool-summary">{entry.summary}</div>
                   {(entry.external || []).map((ext, i) => (
-                    <div
-                      key={i}
-                      style={{
-                        marginTop: "4px",
-                        fontFamily: "ui-monospace, monospace",
-                        fontSize: "11px",
-                        color: ext.ok ? "#93c5fd" : "#9ca3af",
-                      }}
-                    >
-                      ↗ {ext.ok ? "✓" : "–"} {ext.service} {ext.call} · {ext.detail}
+                    <div key={i} className={`ext-call ${ext.ok ? "" : "is-skipped"}`}>
+                      ↗ {ext.service} {ext.call} · {ext.detail}
                     </div>
                   ))}
                   {(entry.memory || []).length > 0 && (
-                    <div style={{ marginTop: "4px", fontSize: "11px", color: "#c4b5fd" }}>
-                      🧠 learned: {(entry.memory || []).join(", ")}
-                    </div>
+                    <div className="learned">🧠 learned: {(entry.memory || []).join(", ")}</div>
                   )}
-                </div>
+                </li>
               ))}
-            </div>
+            </ol>
           )}
         </section>
       </aside>
 
-      {callError && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: "86px",
-            left: "50%",
-            transform: "translateX(-50%)",
-            background: "#7f1d1d",
-            color: "#fecaca",
-            fontSize: "13px",
-            padding: "8px 14px",
-            borderRadius: "8px",
-            zIndex: 40,
-            maxWidth: "90vw",
-          }}
-        >
-          {callError}
+      {/* Talk dock */}
+      {user && (
+        <div className="dock">
+          {callError && (
+            <div className="toast-error" role="alert">
+              {callError}
+            </div>
+          )}
+          <button className={`talk-btn ${inCall ? "is-live" : ""}`} onClick={toggleCall} disabled={callBusy}>
+            <span className="talk-icon">{inCall ? "■" : <MicIcon />}</span>
+            {callBusy ? "Connecting…" : inCall ? "End call" : "Talk to Zara"}
+          </button>
+          <span className="murf-credit">
+            Voice by <b>Murf Falcon</b>
+          </span>
         </div>
       )}
 
-      {/* Floating "Talk to Zara" Button + Murf credit */}
-      {user && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: "8px",
-            left: "50%",
-            transform: "translateX(-50%)",
-            fontSize: "11px",
-            color: "#a78bfa",
-            zIndex: 40,
-            letterSpacing: "0.02em",
-          }}
-        >
-          🔊 Voice by Murf Falcon
-        </div>
-      )}
-      {user && (
-        <button
-          onClick={toggleCall}
-          disabled={callBusy}
-          style={{
-            position: "fixed",
-            bottom: "28px",
-            left: "50%",
-            transform: "translateX(-50%)",
-            background: inCall ? "#ef4444" : "#7c3aed",
-            color: "#fff",
-            border: "none",
-            borderRadius: "999px",
-            padding: "14px 28px",
-            fontSize: "16px",
-            fontWeight: 700,
-            boxShadow: "0 10px 25px rgba(124, 58, 237, 0.4)",
-            zIndex: 40,
-          }}
-        >
-          {callBusy
-            ? "Connecting..."
-            : inCall
-            ? "🔴 End Call with Zara"
-            : "🎙️ Talk to Zara"}
-        </button>
-      )}
-
-      {/* Simple Login Modal (Name + 4-digit PIN) */}
+      {/* Login (name + 4-digit PIN) */}
       {!user && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.75)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 50,
-          }}
-        >
-          <form
-            onSubmit={handleLogin}
-            style={{
-              background: "#181b24",
-              border: "1px solid #2b3040",
-              borderRadius: "16px",
-              padding: "28px",
-              width: "340px",
-              display: "flex",
-              flexDirection: "column",
-              gap: "14px",
-            }}
-          >
-            <h2 style={{ fontSize: "20px", fontWeight: 700 }}>Welcome to VibeCart</h2>
-            <p style={{ fontSize: "13px", color: "#9ca3af" }}>
-              Enter your name and a 4-digit PIN so Zara remembers your vibe.
-            </p>
-            <input
-              type="text"
-              placeholder="Your Name (e.g. Aarav)"
-              value={loginName}
-              onChange={(e) => setLoginName(e.target.value)}
-              required
-              style={{
-                padding: "10px 12px",
-                borderRadius: "8px",
-                border: "1px solid #374151",
-                background: "#0f1117",
-                color: "#fff",
-              }}
-            />
-            <input
-              type="password"
-              inputMode="numeric"
-              maxLength={4}
-              pattern="\d{4}"
-              placeholder="4-digit PIN (e.g. 1234)"
-              value={loginPin}
-              onChange={(e) => setLoginPin(e.target.value)}
-              required
-              style={{
-                padding: "10px 12px",
-                borderRadius: "8px",
-                border: "1px solid #374151",
-                background: "#0f1117",
-                color: "#fff",
-              }}
-            />
+        <div className="overlay">
+          <form className="login-card" onSubmit={handleLogin} role="dialog" aria-modal="true" aria-labelledby="login-title">
+            <div className="zara-orb sm" aria-hidden="true">
+              Z
+            </div>
+            <h2 id="login-title">Welcome to VibeCart</h2>
+            <p className="muted small">Your name and a 4-digit PIN let Zara remember your vibe next time.</p>
+            <label className="field">
+              Name
+              <input
+                type="text"
+                placeholder="e.g. Aarav"
+                autoFocus
+                autoComplete="given-name"
+                value={loginName}
+                onChange={(e) => setLoginName(e.target.value)}
+                required
+              />
+            </label>
+            <label className="field">
+              PIN
+              <input
+                type="password"
+                inputMode="numeric"
+                maxLength={4}
+                pattern="\d{4}"
+                placeholder="4 digits"
+                value={loginPin}
+                onChange={(e) => setLoginPin(e.target.value)}
+                required
+              />
+            </label>
             {loginError && (
-              <div style={{ fontSize: "12px", color: "#f87171" }}>{loginError}</div>
+              <div className="field-error" role="alert">
+                {loginError}
+              </div>
             )}
-            <button
-              type="submit"
-              style={{
-                background: "#7c3aed",
-                color: "#fff",
-                border: "none",
-                borderRadius: "8px",
-                padding: "11px",
-                fontWeight: 600,
-              }}
-            >
-              Enter Store
+            <button type="submit" className="btn btn-primary btn-block" style={{ padding: "12px" }}>
+              Enter the store
             </button>
           </form>
         </div>

@@ -21,7 +21,68 @@ mcp = FastMCP("vibecart", stateless_http=True, host="0.0.0.0", port=8001)
 
 # In-memory tool log read by the backend via GET /tool-log/{user_id}
 TOOL_LOG: List[Dict[str, Any]] = []
+LAST_SHOWCASE: Dict[str, Any] = {"query": "", "items": [], "timestamp": 0}
 _pool: Optional[asyncpg.Pool] = None
+
+
+def set_showcase(query_label: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Number the options (1, 2, 3...) and save them for the real-time UI showcase & option picking."""
+    numbered: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items[:6]):
+        row = dict(item)
+        if isinstance(row.get("sizes"), str):
+            try:
+                row["sizes"] = json.loads(row["sizes"])
+            except Exception:
+                pass
+        row["option"] = idx + 1
+        numbered.append(row)
+    LAST_SHOWCASE["query"] = query_label
+    LAST_SHOWCASE["items"] = numbered
+    LAST_SHOWCASE["timestamp"] = int(time.time())
+    return numbered
+
+
+def _in_stock_sizes(sizes: Any) -> List[str]:
+    if isinstance(sizes, str):
+        try:
+            sizes = json.loads(sizes)
+        except Exception:
+            return []
+    if isinstance(sizes, dict):
+        return [k for k, v in sizes.items() if int(v or 0) > 0]
+    return []
+
+
+def spoken_options(numbered: List[Dict[str, Any]], what: str) -> Dict[str, Any]:
+    """
+    Slim, voice-friendly tool result: the full rows (images, size maps) go to the on-screen showcase,
+    the LLM only gets what it needs to talk, plus a `speak` hint so it never goes silent after the call.
+    """
+    options = [
+        {
+            "option": it["option"],
+            "product_id": it.get("id"),
+            "name": it.get("name"),
+            "colour": it.get("colour"),
+            "price_rupees": it.get("price_inr"),
+            "sizes_in_stock": _in_stock_sizes(it.get("sizes")),
+            **({"reasons": it["reasons"]} if it.get("reasons") else {}),
+        }
+        for it in numbered
+    ]
+    if not options:
+        speak = (
+            f"Tell the shopper you couldn't find any {what} right now, and suggest a different colour, "
+            "item or budget to try."
+        )
+    else:
+        top = "; ".join(f"Option {o['option']}, {o['name']}, {o['price_rupees']} rupees" for o in options[:2])
+        speak = (
+            f"Say that {len(options)} {what} options are now on their screen. Mention {top}. "
+            "Then ask which option they want."
+        )
+    return {"shown_on_screen": True, "options": options, "speak": speak}
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -182,7 +243,11 @@ async def http_get_tool_log(request: Request) -> JSONResponse:
     rows = [
         entry for entry in TOOL_LOG if entry["user_id"] in (None, uid)
     ][-25:]
-    return JSONResponse({"user_id": uid, "logs": list(reversed(rows))})
+    return JSONResponse({
+        "user_id": uid,
+        "logs": list(reversed(rows)),
+        "showcase": LAST_SHOWCASE,
+    })
 
 
 @mcp.tool()
@@ -192,8 +257,12 @@ async def search_products(
     category: Optional[str] = None,
     colour: Optional[str] = None,
     gender: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Search VibeCart products by keyword, max INR price, category, colour, and gender."""
+) -> Dict[str, Any]:
+    """
+    Search VibeCart products by keyword, max INR price, category, colour, and gender.
+    Automatically displays the returned options in real time on the shopper's screen as Option 1, Option 2, etc.
+    After it returns, ALWAYS speak to the shopper using the `speak` hint.
+    """
     args = {
         "query": query,
         "max_price": max_price,
@@ -208,7 +277,7 @@ async def search_products(
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, name, gender, category, article_type, colour, price_inr, stock, sizes
+                SELECT id, name, gender, category, article_type, colour, price_inr, stock, sizes, image_url
                 FROM products
                 WHERE NOT EXISTS (
                         SELECT 1 FROM unnest($1::text[]) AS w
@@ -220,7 +289,7 @@ async def search_products(
                   AND ($4::text IS NULL OR colour ILIKE '%' || $4 || '%')
                   AND ($5::text IS NULL OR gender ILIKE $5 || '%')
                 ORDER BY stock DESC, price_inr ASC
-                LIMIT 8
+                LIMIT 6
                 """,
                 words,
                 max_price,
@@ -228,12 +297,43 @@ async def search_products(
                 colour,
                 gender,
             )
-        results = [dict(r) for r in rows]
-        log_tool("search_products", args, f"Found {len(results)} products", "ok")
-        return results
+            # If strict AND matching found nothing (e.g. "red shorts"), fall back to closest OR matches
+            if not rows and (words or colour or category):
+                search_terms = list(words)
+                if colour:
+                    search_terms.append(colour.strip().lower())
+                if category:
+                    search_terms.append(category.strip().lower().rstrip("s"))
+                rows = await conn.fetch(
+                    """
+                    SELECT id, name, gender, category, article_type, colour, price_inr, stock, sizes, image_url,
+                           (
+                             SELECT COUNT(*) FROM unnest($1::text[]) AS w
+                             WHERE name ILIKE '%' || w || '%' OR article_type ILIKE '%' || w || '%'
+                                OR colour ILIKE '%' || w || '%' OR category ILIKE '%' || w || '%'
+                           ) AS match_hits
+                    FROM products
+                    WHERE EXISTS (
+                            SELECT 1 FROM unnest($1::text[]) AS w
+                            WHERE name ILIKE '%' || w || '%' OR article_type ILIKE '%' || w || '%'
+                               OR colour ILIKE '%' || w || '%' OR category ILIKE '%' || w || '%'
+                          )
+                      AND ($2::int IS NULL OR price_inr <= $2)
+                    ORDER BY match_hits DESC, stock DESC, price_inr ASC
+                    LIMIT 6
+                    """,
+                    search_terms,
+                    max_price,
+                )
+        label_parts = [p for p in (colour, query or category, f"under ₹{max_price}" if max_price else None) if p]
+        query_label = " ".join(label_parts) or "All picks"
+        results = set_showcase(query_label, [dict(r) for r in rows])
+        log_tool("search_products", args, f"Showing {len(results)} options for '{query_label}'", "ok")
+        spoken_label = query_label.replace("under ₹", "under ") + (" rupees" if max_price else "")
+        return spoken_options(results, spoken_label)
     except Exception as exc:
         log_tool("search_products", args, str(exc), "error")
-        return [{"error": str(exc)}]
+        return {"error": str(exc), "speak": "Apologise that the search glitched and ask them to say it again."}
 
 
 @mcp.tool()
@@ -249,6 +349,7 @@ async def get_product(id: int) -> Dict[str, Any]:
             return {"error": "Product not found"}
         item = dict(row)
         log_tool("get_product", args, f"{item['name']} (₹{item['price_inr']})", "ok")
+        item["speak"] = f"Describe {item['name']} in one line, say it's {item['price_inr']} rupees, and ask if they want it."
         return item
     except Exception as exc:
         log_tool("get_product", args, str(exc), "error")
@@ -283,6 +384,11 @@ async def check_stock(id: int, size: str = "M") -> Dict[str, Any]:
             "size": size_key,
             "available_qty": size_qty,
             "in_stock": in_stock,
+            "speak": (
+                f"Tell them {row['name']} is available in size {size_key} and ask if you should add it to the cart."
+                if in_stock
+                else f"Tell them {row['name']} is sold out in size {size_key} and offer another size or option."
+            ),
         }
     except Exception as exc:
         log_tool("check_stock", args, str(exc), "error")
@@ -294,23 +400,38 @@ async def add_to_cart(
     user_id: int,
     product_id: Optional[int] = None,
     product_name: Optional[str] = None,
+    option_number: Optional[int] = None,
     size: str = "M",
     qty: int = 1,
 ) -> Dict[str, Any]:
     """
     Add a product to the shopper's cart. Call this whenever the shopper says "add to cart",
-    "put this in my cart", "I'll take it", or asks to buy/cart a product.
-    Pass `product_id` (preferred) OR `product_name` (e.g. "Nike Cleats", "Red Dress", "Blue Shirt").
+    "I'll take option 1", "give me the second one", "put this in my cart", or asks to buy/cart a product.
+    You can pass:
+    - `option_number` (1, 2, 3... matching the Option # currently shown on screen from the last search), OR
+    - `product_id` (exact integer ID), OR
+    - `product_name` (e.g. "Man Plaid Shirt", "Red Shoes").
     If they didn't mention a size, omit `size` and an available size will be chosen automatically.
     """
     args = {
         "user_id": user_id,
         "product_id": product_id,
         "product_name": product_name,
+        "option_number": option_number,
         "size": size,
         "qty": qty,
     }
     try:
+        if product_id is None and option_number is not None:
+            shown = LAST_SHOWCASE.get("items") or []
+            idx = int(option_number) - 1
+            if 0 <= idx < len(shown):
+                product_id = int(shown[idx]["id"])
+        # Also handle if the LLM passed a small option index (1..6) as product_id when those aren't real product IDs
+        if product_id is not None and 1 <= int(product_id) <= len(LAST_SHOWCASE.get("items") or []):
+            shown_ids = {int(it["id"]) for it in (LAST_SHOWCASE.get("items") or [])}
+            if int(product_id) not in shown_ids:
+                product_id = int(LAST_SHOWCASE["items"][int(product_id) - 1]["id"])
         pool = await get_pool()
         async with pool.acquire() as conn:
             prod = None
@@ -340,14 +461,21 @@ async def add_to_cart(
             if not prod:
                 target = f"#{product_id}" if product_id is not None else f"'{product_name}'"
                 log_tool("add_to_cart", args, f"Product {target} not found", "error", user_id)
-                return {"error": f"Product {target} not found"}
+                return {
+                    "error": f"Product {target} not found",
+                    "speak": "Say you couldn't find that one and ask which option number they meant.",
+                }
 
             real_id = int(prod["id"])
             resolved_size, available = resolve_size(prod, size)
             if available < qty:
                 msg = f"{prod['name']} ({resolved_size}) has only {available} left"
                 log_tool("add_to_cart", args, msg, "error", user_id)
-                return {"error": msg, "available_qty": available}
+                return {
+                    "error": msg,
+                    "available_qty": available,
+                    "speak": f"Tell them {msg}, and offer another size or a similar option.",
+                }
 
             await conn.execute(
                 """
@@ -374,6 +502,10 @@ async def add_to_cart(
             "qty": qty,
             "price_inr": prod["price_inr"],
             "message": summary,
+            "speak": (
+                f"Confirm {prod['name']} in size {resolved_size} for {prod['price_inr']} rupees is in their cart, "
+                "hype the pick, and ask if they want anything else or want to check out."
+            ),
         }
     except Exception as exc:
         log_tool("add_to_cart", args, str(exc), "error", user_id)
@@ -418,7 +550,11 @@ async def remove_from_cart(
             learned = await learn(conn, user_id, product_id, "REMOVED", -1.0)
         summary = f"Removed {qty or 'all'} of product #{product_id}" + (f" ({size.upper()})" if size else "")
         log_tool("remove_from_cart", args, summary, "ok", user_id, None, learned)
-        return {"ok": True, "message": summary}
+        return {
+            "ok": True,
+            "message": summary,
+            "speak": "Confirm it's out of their cart and ask what they'd like instead.",
+        }
     except Exception as exc:
         log_tool("remove_from_cart", args, str(exc), "error", user_id)
         return {"error": str(exc)}
@@ -461,6 +597,12 @@ async def view_cart(user_id: int) -> Dict[str, Any]:
             "subtotal_inr": subtotal,
             "discount_inr": discount,
             "total_inr": total,
+            "speak": (
+                f"Tell them they have {len(items)} item{'s' if len(items) != 1 else ''} in the cart, "
+                f"total {total} rupees, and ask if they want to check out."
+                if items
+                else "Tell them the cart is empty and ask what they want to shop for."
+            ),
         }
     except Exception as exc:
         log_tool("view_cart", args, str(exc), "error", user_id)
@@ -481,7 +623,10 @@ async def apply_coupon(user_id: int, code: str) -> Dict[str, Any]:
             )
             if not coupon:
                 log_tool("apply_coupon", args, f"Invalid coupon {clean_code}", "error", user_id)
-                return {"error": f"Coupon {clean_code} is invalid or expired"}
+                return {
+                    "error": f"Coupon {clean_code} is invalid or expired",
+                    "speak": f"Tell them {clean_code} didn't work, sweetly.",
+                }
 
             await conn.execute(
                 """
@@ -494,7 +639,12 @@ async def apply_coupon(user_id: int, code: str) -> Dict[str, Any]:
             )
         summary = f"Applied {clean_code} ({coupon['discount_pct']}% off)"
         log_tool("apply_coupon", args, summary, "ok", user_id)
-        return {"ok": True, "coupon": clean_code, "discount_pct": coupon["discount_pct"]}
+        return {
+            "ok": True,
+            "coupon": clean_code,
+            "discount_pct": coupon["discount_pct"],
+            "speak": f"Celebrate that {clean_code} gave them {coupon['discount_pct']} percent off.",
+        }
     except Exception as exc:
         log_tool("apply_coupon", args, str(exc), "error", user_id)
         return {"error": str(exc)}
@@ -512,7 +662,7 @@ async def checkout(user_id: int) -> Dict[str, Any]:
         items = cart.get("items") or []
         if not items:
             log_tool("checkout", args, "Cart is empty", "error", user_id)
-            return {"error": "Cart is empty"}
+            return {"error": "Cart is empty", "speak": "Tell them the cart is empty, so nothing to check out yet."}
 
         total_inr = int(cart["total_inr"])
         discount_inr = int(cart["discount_inr"])
@@ -599,6 +749,10 @@ async def checkout(user_id: int) -> Dict[str, Any]:
             "currency": "INR",
             "razorpay_key_id": key_id,
             "status": order_row["status"],
+            "speak": (
+                f"Read out order number {order_row['id']} and tracking ID {order_row['tracking_id']}, "
+                f"total {order_row['amount_inr']} rupees, then tell them to tap the Pay button on screen."
+            ),
         }
     except Exception as exc:
         log_tool("checkout", args, str(exc), "error", user_id)
@@ -621,6 +775,7 @@ async def get_order_status(order_id: int) -> Dict[str, Any]:
             return {"error": "Order not found"}
         data = dict(row)
         data["created_at"] = str(data["created_at"])
+        data["speak"] = f"Tell them order {order_id} is {data['status']}, tracking ID {data['tracking_id']}."
         log_tool("get_order_status", args, f"Order #{order_id}: {data['status']}", "ok", data["user_id"])
         return data
     except Exception as exc:
@@ -629,7 +784,7 @@ async def get_order_status(order_id: int) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def get_purchase_history(user_id: int) -> List[Dict[str, Any]]:
+async def get_purchase_history(user_id: int) -> Dict[str, Any]:
     """Retrieve the user's past orders and purchased items."""
     args = {"user_id": user_id}
     try:
@@ -653,10 +808,17 @@ async def get_purchase_history(user_id: int) -> List[Dict[str, Any]]:
                 d["items"] = json.loads(d["items"])
             history.append(d)
         log_tool("get_purchase_history", args, f"Fetched {len(history)} past orders", "ok", user_id)
-        return history
+        return {
+            "orders": history,
+            "speak": (
+                "Summarise their last couple of buys in one line and playfully tease any repeat habit."
+                if history
+                else "Tell them this is their first order with you and you're excited."
+            ),
+        }
     except Exception as exc:
         log_tool("get_purchase_history", args, str(exc), "error", user_id)
-        return [{"error": str(exc)}]
+        return {"error": str(exc), "speak": "Say you couldn't pull up their orders right now."}
 
 
 @mcp.tool()
@@ -699,7 +861,11 @@ async def remember_preference(
             )
         summary = f"Remembered: {fact}"
         log_tool("remember_preference", args, summary, "ok", user_id, None, [fact])
-        return {"ok": True, "remembered": fact}
+        return {
+            "ok": True,
+            "remembered": fact,
+            "speak": f"Casually acknowledge you'll remember that ({value}) and carry on helping them shop.",
+        }
     except Exception as exc:
         log_tool("remember_preference", args, str(exc), "error", user_id)
         return {"error": str(exc)}
@@ -724,19 +890,25 @@ async def recall_memory(user_id: int) -> Dict[str, Any]:
                  "times": r["hits"], "told_by_user": r["source"] == "explicit"}
             )
         log_tool("recall_memory", args, f"Recalled {len(rows)} memories", "ok", user_id)
-        return grouped or {"note": "No memories yet — first time shopper."}
+        if not grouped:
+            return {
+                "note": "No memories yet — first time shopper.",
+                "speak": "Say you're still learning their taste and ask what they like.",
+            }
+        return {**grouped, "speak": "Answer their question from these memories in one or two lines."}
     except Exception as exc:
         log_tool("recall_memory", args, str(exc), "error", user_id)
         return {"error": str(exc)}
 
 
 @mcp.tool()
-async def recommend_for_me(user_id: int, query: str = "", limit: int = 5) -> List[Dict[str, Any]]:
+async def recommend_for_me(user_id: int, query: str = "", limit: int = 5) -> Dict[str, Any]:
     """
     Personalised picks from the memory graph (their liked colours/items/price band, minus things they
     avoid, plus what similar shoppers bought). Each result has `reasons` and `in_your_size`.
     Use for "suggest something", "what would I like?", or to pick between search results.
     Optional query narrows the item type (e.g. 'shirt', 'shoes').
+    Results pop up on the shopper's screen; ALWAYS speak to them afterwards using the `speak` hint.
     """
     args = {"user_id": user_id, "query": query, "limit": limit}
     try:
@@ -747,15 +919,32 @@ async def recommend_for_me(user_id: int, query: str = "", limit: int = 5) -> Lis
             )
         picks = [dict(r) for r in rows]
         for p in picks:
+            # mem_recommend names the column product_id; the showcase, UI and option picking expect `id`
+            p["id"] = p["product_id"]
             p["score"] = round(p["score"], 2)
         if not picks:
             return await search_products(query=query)
+        async with pool.acquire() as conn:
+            ids = [int(p["id"]) for p in picks]
+            extra_rows = await conn.fetch(
+                "SELECT id, sizes, image_url, stock FROM products WHERE id = ANY($1::int[])",
+                ids,
+            )
+            extra_map = {int(r["id"]): dict(r) for r in extra_rows}
+        for p in picks:
+            ext = extra_map.get(int(p["id"]), {})
+            p["sizes"] = ext.get("sizes")
+            p["image_url"] = ext.get("image_url")
+            p["stock"] = ext.get("stock", 10)
+        picks = set_showcase(query or "Recommended for you", picks)
         top = f" — top: {picks[0]['name']}" if picks else ""
         log_tool("recommend_for_me", args, f"{len(picks)} picks from memory graph{top}", "ok", user_id)
-        return picks
+        result = spoken_options(picks, f"{query} picks for you" if query else "personalised picks")
+        result["speak"] += " Use one of the reasons to say why it suits them."
+        return result
     except Exception as exc:
         log_tool("recommend_for_me", args, str(exc), "error", user_id)
-        return [{"error": str(exc)}]
+        return {"error": str(exc), "speak": "Apologise that recommendations glitched and offer to search instead."}
 
 
 if __name__ == "__main__":

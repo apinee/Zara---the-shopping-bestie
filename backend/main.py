@@ -56,6 +56,13 @@ class PaymentVerifyRequest(BaseModel):
     razorpay_signature: str
 
 
+class CartAddRequest(BaseModel):
+    user_id: int
+    product_id: int
+    size: str = "M"
+    qty: int = 1
+
+
 @app.post("/login")
 async def login(req: LoginRequest):
     """
@@ -247,6 +254,50 @@ async def get_cart(user_id: int):
         "discount_inr": discount_inr,
         "total_inr": max(0, subtotal - discount_inr),
     }
+
+
+@app.post("/cart/add")
+async def add_to_cart_http(req: CartAddRequest):
+    """Add a product to the user's cart directly from the UI (e.g., clicking a Zara live option card)."""
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        prod = await conn.fetchrow(
+            "SELECT id, name, price_inr, stock, sizes FROM products WHERE id = $1",
+            req.product_id,
+        )
+        if not prod:
+            raise HTTPException(status_code=404, detail="Product not found")
+        sizes = prod["sizes"]
+        if isinstance(sizes, str):
+            sizes = json.loads(sizes)
+        chosen_size = req.size.strip() if req.size else "M"
+        if isinstance(sizes, dict) and sizes:
+            if len(sizes) == 1:
+                chosen_size = next(iter(sizes))
+            elif chosen_size not in sizes:
+                chosen_size = next((k for k, v in sizes.items() if int(v) > 0), next(iter(sizes)))
+        await conn.execute(
+            """
+            INSERT INTO cart_items (user_id, product_id, size, qty)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id, product_id, size)
+            DO UPDATE SET qty = cart_items.qty + EXCLUDED.qty
+            """,
+            req.user_id,
+            req.product_id,
+            chosen_size,
+            req.qty,
+        )
+        try:
+            await conn.fetchval(
+                "SELECT mem_learn_product($1, $2, 'CARTED', 1.0, $3)",
+                req.user_id,
+                req.product_id,
+                chosen_size,
+            )
+        except Exception:
+            pass
+    return await get_cart(req.user_id)
 
 
 @app.get("/memory/{user_id}")
